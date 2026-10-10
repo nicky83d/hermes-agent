@@ -84,7 +84,64 @@ class _ThreadRoutingStream:
         return self._target().fileno()
 
     def __getattr__(self, name):  # type: ignore[no-untyped-def]
-        return getattr(self._target(), name)
+        target = self._target()
+        # NEVER DELEGATE IN A CIRCLE. ``_SafeWriter`` and this proxy each forward unknown attributes
+        # to what they wrap, so if each one is the other's target the two frames alternate until
+        # Python's stack dies - which is exactly what happened live on the gateway: from 01:54 to
+        # 09:19 every agent created in an api_server worker thread failed in ``setup_logging`` at
+        # ``getattr(sys.stdout, "line_buffering")`` with ~500 alternating ``_SafeWriter.__getattr__``
+        # / ``_ThreadRoutingStream.__getattr__`` frames, so every request Janet made for a choice came
+        # back HTTP 500. A stream that leads back here has no such attribute; say so.
+        if target is self or _reaches(target, self):
+            raise AttributeError(name)
+        return getattr(target, name)
+
+
+def _reaches(stream, want, limit: int = 32) -> bool:
+    """True if following ``stream``'s wrappers reaches ``want`` - i.e. walking it would loop.
+
+    Follows the two delegation links in either order (``_passthrough`` for a routing proxy,
+    ``_inner`` for a writer wrapper) using ``object.__getattribute__`` so a proxy's own
+    ``__getattr__`` is never consulted while we are trying to decide whether to consult it.
+    """
+    seen = 0
+    while stream is not None and seen < limit:
+        if stream is want:
+            return True
+        try:
+            stream = object.__getattribute__(stream, "_passthrough")
+        except Exception:
+            try:
+                stream = object.__getattribute__(stream, "_inner")
+            except Exception:
+                return False
+        seen += 1
+    return False
+
+
+def _installed_proxy_within(stream, limit: int = 32):
+    """A routing proxy already installed somewhere in ``stream``'s chain, or None.
+
+    ``_ensure_installed`` only RECOGNISED a proxy when it was ``sys.<attr>`` itself. Any wrapper in
+    front of it (``_install_safe_stdio`` puts a ``_SafeWriter`` there, and every agent construction
+    calls it) made the next install build yet another routing proxy whose passthrough was the wrapper
+    around the previous one - one more layer per agent created, and the two ends of that stack
+    delegating to each other. Finding the proxy through the wrapper stops the stack growing and
+    keeps routing intact, because the wrapper forwards ``write``/``flush`` into it either way.
+    """
+    seen = 0
+    while stream is not None and seen < limit:
+        if isinstance(stream, _ThreadRoutingStream):
+            return stream
+        try:
+            stream = object.__getattribute__(stream, "_inner")
+        except Exception:
+            try:
+                stream = object.__getattribute__(stream, "_passthrough")
+            except Exception:
+                return None
+        seen += 1
+    return None
 
 
 def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
@@ -100,6 +157,14 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
             return current
         if proxy is not None and current is proxy:
             return proxy
+        # A PROXY IN FRONT OF A WRAPPER IS STILL INSTALLED. Recognising only a bare proxy let the
+        # chain grow one layer per agent construction (see _installed_proxy_within) until its two
+        # ends delegated to each other.
+        existing = _installed_proxy_within(current)
+        if existing is not None:
+            _installed[attr] = existing
+            _routing_states[attr] = existing._state
+            return existing
         # Route non-silenced threads to whatever is currently bound (an active
         # global redirect keeps its old behavior).
         passthrough = current if current is not None else passthrough

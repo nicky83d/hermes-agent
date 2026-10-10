@@ -17,6 +17,7 @@ from typing import Any, Optional
 from hermes_bootstrap import _happy_eyeballs_create_connection
 from utils import base_url_hostname, normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy
+from agent.thread_scoped_output import _reaches
 
 
 _OPENAI_CLS_CACHE = None
@@ -164,7 +165,16 @@ class _SafeWriter:
             return False
 
     def __getattr__(self, name):
-        return getattr(self._inner, name)
+        inner = self._inner
+        # NEVER DELEGATE IN A CIRCLE. This wrapper and ``_ThreadRoutingStream`` both forward unknown
+        # attributes to what they wrap; when each is the other's link the two frames alternate until
+        # Python's stack dies. Live: 01:54 -> 09:19 the gateway could not create a single agent in an
+        # api_server worker thread (``getattr(sys.stdout, "line_buffering")`` in setup_logging), so
+        # every request Janet made for a choice returned HTTP 500. A wrapper that leads back here has
+        # no such attribute; say so instead of recursing.
+        if inner is self or _reaches(inner, self):
+            raise AttributeError(name)
+        return getattr(inner, name)
 
 
 def _get_proxy_from_env() -> Optional[str]:
